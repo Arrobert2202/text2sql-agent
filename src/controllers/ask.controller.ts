@@ -7,10 +7,10 @@ const aiService = new AIService(postgresDb);
 export class AskController {
     static async ask(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
-            const { question } = req.body;
+            const { question, tenantId } = req.body;
             if (!question) { res.status(400).json({ error: "Te rog să trimiți o întrebare în câmpul 'question'." }); return; }
-            const response = await aiService.processQuestion('default_tenant', question);
-            res.json({ result: response.text, chartUrl: response.chartUrl, isError: response.isError });
+            const response = await aiService.processQuestion(tenantId || 'default_tenant', question);
+            res.json({ answer: { text: response.text, chartUrl: response.chartUrl, isError: response.isError }, sql: response.sql });
         } catch (error) { next(error); }
     }
 }

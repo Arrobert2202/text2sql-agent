@@ -10,6 +10,11 @@ export interface DatabaseService {
     query(query: string, params?: any[]): any[] | Promise<any[]>;
 
     /**
+     * Executes a query exclusively using a hardened read-only connection pool.
+     */
+    queryReadOnly(query: string, params?: any[]): any[] | Promise<any[]>;
+
+    /**
      * Retrieves the database schema formatted as a string for the LLM.
      */
     getSchema(): string | Promise<string>;

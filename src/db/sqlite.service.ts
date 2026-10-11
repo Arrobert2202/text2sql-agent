@@ -55,6 +55,7 @@ export class SqliteService implements DatabaseService {
 
     public execute(query: string): void { this.db.exec(query); }
     public query(query: string, params: any[] = []): any[] { return this.db.prepare(query).all(...params); }
+    public queryReadOnly(query: string, params: any[] = []): any[] { return this.query(query, params); }
     public getSchema(): string {
         const tables = this.db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).all() as { sql: string }[];
         return tables.map(t => t.sql).join('\n\n');

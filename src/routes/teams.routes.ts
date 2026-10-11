@@ -18,12 +18,13 @@ router.post('/messages', async (req: Request, res: Response) => {
             logger.info(`[Teams] Received message with text: "${userText}"`);
 
             // Process the AI query
-            const answer = await aiService.processQuestion(userText);
+            const tenantId = conversation?.tenantId || conversation?.id || 'default_tenant';
+            const answer = await aiService.processQuestion(tenantId, userText);
 
             // 2. Prepare the Microsoft Bot Framework response payload structure
             const replyPayload = {
                 type: 'message',
-                text: answer,
+                text: answer.text,
                 replyToId: req.body.id,
                 conversation: { id: conversation?.id },
                 recipient: { id: from?.id, name: from?.name }
