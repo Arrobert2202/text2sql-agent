@@ -36,7 +36,25 @@ export class AIService {
             ? `2. This is the tenant's dedicated database. Query their tables directly based on their schema without assuming artificial tenant_id filters unless the table explicitly defines it.`
             : `2. CRITICAL: Assume the user belongs to tenant/company ID '${tenantId}'. If and ONLY if a table explicitly contains a 'tenant_id' column in the schema above, you MUST filter by tenant_id = '${tenantId}'. Do NOT invent a tenant_id column for tables that do not have it (like auto_parts, customers, orders).`;
 
-        const systemPrompt = `You are a senior SQL data analyst. Convert user questions into valid PostgreSQL queries based on this schema:\n${schema}\nRules:\n1. Return ONLY the raw SQL query, no markdown, no explanations.\n${tenantRule}\n3. CRITICAL: For string matching, NEVER use the exact user phrase as a single ILIKE. You MUST split the phrase into 1-2 core keywords (root words) and use them with AND. E.g. DO NOT write ILIKE '%filtrul de aer%', instead write name ILIKE '%filtru%' AND name ILIKE '%aer%'\n4. Assume the user is referring to the 'name' column if they mention a product or person without specifying a column.\n5. If the user asks for a chart, graph, or visual, output the SQL query that fetches the DATA needed for that chart.\n6. Only return "INVALID_QUESTION" if the query is completely outside the scope of the schema. Map general business terms like 'products', 'stock', 'inventory' to 'auto_parts', and 'clients' to 'customers'.`;
+        // Fetch canonical governed metrics for this tenant (Context Hub injection)
+        let governedMetricsSection = '';
+        try {
+            const metrics = await this.dbService.query(
+                `SELECT name, description, sql_formula FROM governed_metrics WHERE tenant_id = $1`,
+                [tenantId]
+            );
+            if (metrics && metrics.length > 0) {
+                const metricsText = metrics.map((m) =>
+                    `- **${m.name}**: ${m.description ?? ''}\n  Formula: ${m.sql_formula}`
+                ).join('\n');
+                governedMetricsSection = `\n\n### GOVERNED REVOPS METRICS (CANONICAL FORMULAS — USE THESE EXACTLY)\nWhen a user asks for any of the following metrics by name, you MUST use the exact SQL formula provided below without modification:\n${metricsText}`;
+                logger.info(`Injected ${metrics.length} governed metrics into SQL generation prompt for tenant ${tenantId}`);
+            }
+        } catch (err) {
+            logger.warn({ err }, 'Failed to fetch governed metrics for prompt injection');
+        }
+
+        const systemPrompt = `You are a senior SQL data analyst. Convert user questions into valid PostgreSQL queries based on this schema:\n${schema}${governedMetricsSection}\nRules:\n1. Return ONLY the raw SQL query, no markdown, no explanations.\n${tenantRule}\n3. CRITICAL: For string matching, NEVER use the exact user phrase as a single ILIKE. You MUST split the phrase into 1-2 core keywords (root words) and use them with AND. E.g. DO NOT write ILIKE '%filtrul de aer%', instead write name ILIKE '%filtru%' AND name ILIKE '%aer%'\n4. Assume the user is referring to the 'name' column if they mention a product or person without specifying a column.\n5. If the user asks for a chart, graph, or visual, output the SQL query that fetches the DATA needed for that chart.\n6. Only return "INVALID_QUESTION" if the query is completely outside the scope of the schema. Map general business terms like 'products', 'stock', 'inventory' to 'auto_parts', and 'clients' to 'customers'.`;
 
         const response = await this.openai.chat.completions.create({
             model: 'gpt-4o-mini',

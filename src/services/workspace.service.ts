@@ -1,10 +1,7 @@
-import Stripe from 'stripe';
 import { DatabaseService } from '../db/database.interface';
 import { logger } from '../utils/logger';
 import { encrypt, decrypt } from '../utils/crypto';
-import { env } from '../config/env';
-
-const stripe = env.STRIPE_SECRET_KEY ? new Stripe(env.STRIPE_SECRET_KEY) : null;
+import { reportMeteredUsageToLemonSqueezy } from './billing.service';
 
 export interface TenantDbConfig {
     host: string;
@@ -63,17 +60,17 @@ export class WorkspaceService {
     }
 
     /**
-     * Updates subscription status and optional Stripe Customer ID by Tenant ID.
+     * Updates subscription status and optional Lemon Squeezy Customer ID by Tenant ID.
      */
-    public async updateSubscriptionStatus(tenantId: string, status: string, stripeCustomerId?: string): Promise<void> {
+    public async updateSubscriptionStatus(tenantId: string, status: string, lsCustomerId?: string): Promise<void> {
         try {
-            if (stripeCustomerId) {
+            if (lsCustomerId) {
                 const query = `
                     UPDATE workspaces
-                    SET subscription_status = $1, stripe_customer_id = $2
+                    SET subscription_status = $1, ls_customer_id = $2
                     WHERE tenant_id = $3;
                 `;
-                await this.dbService.query(query, [status, stripeCustomerId, tenantId]);
+                await this.dbService.query(query, [status, lsCustomerId, tenantId]);
             } else {
                 const query = `
                     UPDATE workspaces
@@ -90,44 +87,44 @@ export class WorkspaceService {
     }
 
     /**
-     * Updates subscription status matching Stripe customer ID from incoming webhooks.
+     * Updates subscription status matching Lemon Squeezy subscription ID from webhooks.
      */
-    public async updateSubscriptionByCustomerId(stripeCustomerId: string, status: string): Promise<void> {
+    public async updateSubscriptionByLsId(lsSubscriptionId: string, status: string): Promise<void> {
         try {
             const query = `
                 UPDATE workspaces
                 SET subscription_status = $1
-                WHERE stripe_customer_id = $2;
+                WHERE ls_subscription_id = $2;
             `;
-            await this.dbService.query(query, [status, stripeCustomerId]);
-            logger.info(`Updated workspace with stripe_customer_id ${stripeCustomerId} to "${status}"`);
+            await this.dbService.query(query, [status, lsSubscriptionId]);
+            logger.info(`Updated workspace with ls_subscription_id ${lsSubscriptionId} to "${status}"`);
         } catch (error) {
-            logger.error({ err: error }, `Failed to update subscription by Stripe Customer ID ${stripeCustomerId}`);
+            logger.error({ err: error }, `Failed to update subscription by LS ID ${lsSubscriptionId}`);
             throw error;
         }
     }
 
     /**
-     * Saves the Stripe subscription item ID used for metered overage billing.
+     * Saves the Lemon Squeezy subscription item ID used for metered overage billing.
      */
-    public async setSubscriptionItemByCustomer(stripeCustomerId: string, subscriptionItemId: string): Promise<void> {
+    public async setLsSubscriptionItem(lsSubscriptionId: string, subscriptionItemId: string): Promise<void> {
         try {
             const query = `
                 UPDATE workspaces
-                SET stripe_subscription_item_id = $1
-                WHERE stripe_customer_id = $2;
+                SET ls_subscription_item_id = $1
+                WHERE ls_subscription_id = $2;
             `;
-            await this.dbService.query(query, [subscriptionItemId, stripeCustomerId]);
-            logger.info(`Attached stripe_subscription_item_id ${subscriptionItemId} for customer ${stripeCustomerId}`);
+            await this.dbService.query(query, [subscriptionItemId, lsSubscriptionId]);
+            logger.info(`Attached ls_subscription_item_id ${subscriptionItemId} for subscription ${lsSubscriptionId}`);
         } catch (error) {
-            logger.error({ err: error }, `Failed to set subscription item for customer ${stripeCustomerId}`);
+            logger.error({ err: error }, `Failed to set LS subscription item for subscription ${lsSubscriptionId}`);
         }
     }
 
     /**
      * Increments the query counter for the workspace.
      * Base subscription includes 200 queries. Any query beyond 200 reports
-     * metered overage to Stripe in real-time.
+     * metered overage to Lemon Squeezy in real-time.
      */
     public async recordQueryUsage(tenantId: string): Promise<number> {
         try {
@@ -135,38 +132,22 @@ export class WorkspaceService {
                 UPDATE workspaces
                 SET current_period_queries = current_period_queries + 1
                 WHERE tenant_id = $1
-                RETURNING current_period_queries, stripe_customer_id, stripe_subscription_item_id;
+                RETURNING current_period_queries, ls_subscription_item_id;
             `;
             const rows = await this.dbService.query(query, [tenantId]);
             if (!rows || rows.length === 0) return 0;
 
             const currentQueries = rows[0].current_period_queries as number;
-            const stripeCustomerId = rows[0].stripe_customer_id as string | null;
-            const subscriptionItemId = rows[0].stripe_subscription_item_id as string | null;
+            const subscriptionItemId = rows[0].ls_subscription_item_id as string | null;
 
             logger.info(`Tenant ${tenantId} executed query #${currentQueries} this billing period.`);
 
-            // Hybrid overage threshold: > 200 queries ($10 per 100 extra queries)
-            if (currentQueries > 200 && stripe) {
+            // Report metered overage to Lemon Squeezy when > 200 queries
+            if (currentQueries > 200 && subscriptionItemId) {
                 try {
-                    if (stripeCustomerId) {
-                        await stripe.billing.meterEvents.create({
-                            event_name: 'query_execution',
-                            payload: {
-                                stripe_customer_id: stripeCustomerId,
-                                value: '1'
-                            }
-                        });
-                        logger.info(`Reported 1 metered overage query via Stripe Meter Events for customer ${stripeCustomerId}`);
-                    } else if (subscriptionItemId && (stripe.subscriptionItems as any).createUsageRecord) {
-                        await (stripe.subscriptionItems as any).createUsageRecord(subscriptionItemId, {
-                            quantity: 1,
-                            timestamp: Math.floor(Date.now() / 1000),
-                            action: 'increment'
-                        });
-                    }
-                } catch (stripeErr) {
-                    logger.error({ err: stripeErr }, `Failed to report Stripe metered overage for tenant ${tenantId}`);
+                    await reportMeteredUsageToLemonSqueezy(subscriptionItemId);
+                } catch (lsErr) {
+                    logger.error({ err: lsErr }, `Failed to report Lemon Squeezy metered overage for tenant ${tenantId}`);
                 }
             }
 
@@ -178,19 +159,20 @@ export class WorkspaceService {
     }
 
     /**
-     * Resets the period query count to 0 when a new billing cycle invoice is generated.
+     * Resets the period query count to 0 when a new billing cycle is confirmed.
+     * Called on `subscription_payment_success` webhook from Lemon Squeezy.
      */
-    public async resetQueryUsageByCustomer(stripeCustomerId: string): Promise<void> {
+    public async resetQueryUsageByLsSubscriptionId(lsSubscriptionId: string): Promise<void> {
         try {
             const query = `
                 UPDATE workspaces
                 SET current_period_queries = 0
-                WHERE stripe_customer_id = $1;
+                WHERE ls_subscription_id = $1;
             `;
-            await this.dbService.query(query, [stripeCustomerId]);
-            logger.info(`Reset current_period_queries to 0 for Stripe customer ${stripeCustomerId}`);
+            await this.dbService.query(query, [lsSubscriptionId]);
+            logger.info(`Reset current_period_queries to 0 for LS subscription ${lsSubscriptionId}`);
         } catch (error) {
-            logger.error({ err: error }, `Failed to reset query usage for Stripe customer ${stripeCustomerId}`);
+            logger.error({ err: error }, `Failed to reset query usage for LS subscription ${lsSubscriptionId}`);
         }
     }
 

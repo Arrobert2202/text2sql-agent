@@ -6,16 +6,9 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { ApiClient, AskQuestionResponse } from "@/lib/api-client";
 
-interface PlaygroundResult {
-  answer?: {
-    text: string;
-    chartUrl?: string | null;
-    isError?: boolean;
-  };
-  sql?: string;
-  cached?: boolean;
-}
+type PlaygroundResult = AskQuestionResponse;
 
 export default function PlaygroundPage() {
   const [query, setQuery] = React.useState("What are our top 3 products by stock level?");
@@ -28,14 +21,7 @@ export default function PlaygroundPage() {
 
     setIsLoading(true);
     try {
-      const res = await fetch("http://localhost:3000/api/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: query, tenantId: "default_tenant" }),
-      });
-
-      if (!res.ok) throw new Error("Backend query failed");
-      const data = (await res.json()) as PlaygroundResult;
+      const data = await ApiClient.askQuestion(query, "default_tenant");
       setResult(data);
       toast.success("Query processed through Text-to-SQL engine!");
     } catch (err: unknown) {

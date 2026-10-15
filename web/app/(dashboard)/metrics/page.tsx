@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Plus, Search, Trash2, Copy, Check, Calculator, Sparkles } from "lucide-react";
+import { Plus, Search, Trash2, Copy, Check, Calculator, Sparkles, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -30,120 +30,93 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { ApiClient, GovernedMetric } from "@/lib/api-client";
 
-export interface MetricDefinition {
-  id: string;
-  name: string;
-  alias: string;
-  category: "Sales" | "Pipeline" | "Finance" | "Inventory";
-  description: string;
-  sqlFormula: string;
-  verified: boolean;
-}
-
-const initialMetrics: MetricDefinition[] = [
-  {
-    id: "m-1",
-    name: "Win Rate",
-    alias: "win_rate",
-    category: "Sales",
-    description: "Percentage of closed-won opportunities over all closed deals.",
-    sqlFormula: "(COUNT(CASE WHEN stage = 'Closed Won' THEN 1 END)::float / NULLIF(COUNT(CASE WHEN stage IN ('Closed Won', 'Closed Lost') THEN 1 END), 0)) * 100",
-    verified: true,
-  },
-  {
-    id: "m-2",
-    name: "Pipeline Velocity",
-    alias: "pipeline_velocity",
-    category: "Pipeline",
-    description: "Speed at which qualified leads convert into recognized revenue.",
-    sqlFormula: "(COUNT(id) * AVG(amount) * (win_rate / 100)) / NULLIF(AVG(sales_cycle_days), 0)",
-    verified: true,
-  },
-  {
-    id: "m-3",
-    name: "Average Deal Size",
-    alias: "avg_deal_size",
-    category: "Sales",
-    description: "Average ARR/ACV value across all closed-won contracts.",
-    sqlFormula: "AVG(amount) FILTER (WHERE stage = 'Closed Won')",
-    verified: true,
-  },
-  {
-    id: "m-4",
-    name: "Gross Churn Rate",
-    alias: "gross_churn",
-    category: "Finance",
-    description: "Total lost recurring revenue as a proportion of beginning MRR.",
-    sqlFormula: "(SUM(churned_mrr) / NULLIF(SUM(starting_mrr), 0)) * 100",
-    verified: true,
-  },
-  {
-    id: "m-5",
-    name: "Low Stock Alert Threshold",
-    alias: "stock_critical",
-    category: "Inventory",
-    description: "Items currently below reserve operating threshold.",
-    sqlFormula: "COUNT(*) FILTER (WHERE stock < 15)",
-    verified: true,
-  },
-];
+const TENANT_ID = process.env.NEXT_PUBLIC_TENANT_ID || "default_tenant";
 
 export default function MetricsPage() {
-  const [metrics, setMetrics] = React.useState<MetricDefinition[]>(initialMetrics);
+  const [metrics, setMetrics] = React.useState<GovernedMetric[]>([]);
+  const [isLoading, setIsLoading] = React.useState(true);
   const [search, setSearch] = React.useState("");
   const [isOpen, setIsOpen] = React.useState(false);
-  const [copiedId, setCopiedId] = React.useState<string | null>(null);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const [copiedId, setCopiedId] = React.useState<number | null>(null);
 
   // Form State
   const [name, setName] = React.useState("");
-  const [alias, setAlias] = React.useState("");
-  const [category, setCategory] = React.useState<"Sales" | "Pipeline" | "Finance" | "Inventory">("Sales");
   const [description, setDescription] = React.useState("");
   const [sqlFormula, setSqlFormula] = React.useState("");
+
+  // Fetch metrics from live backend on mount
+  React.useEffect(() => {
+    let cancelled = false;
+    setIsLoading(true);
+    ApiClient.getMetrics(TENANT_ID)
+      .then((data) => {
+        if (!cancelled) setMetrics(data);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) toast.error(`Failed to load metrics: ${err.message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const filteredMetrics = metrics.filter(
     (m) =>
       m.name.toLowerCase().includes(search.toLowerCase()) ||
-      m.sqlFormula.toLowerCase().includes(search.toLowerCase()) ||
-      m.category.toLowerCase().includes(search.toLowerCase())
+      m.sql_formula.toLowerCase().includes(search.toLowerCase()) ||
+      (m.description ?? "").toLowerCase().includes(search.toLowerCase())
   );
 
-  const handleCreate = (e: React.FormEvent) => {
+  const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name || !sqlFormula) {
       toast.error("Please fill in both the Metric Name and SQL Formula.");
       return;
     }
 
-    const newMetric: MetricDefinition = {
-      id: `m-${Date.now()}`,
-      name,
-      alias: alias || name.toLowerCase().replace(/\s+/g, "_"),
-      category,
-      description: description || "Custom user-defined canonical metric.",
-      sqlFormula,
-      verified: true,
-    };
-
-    setMetrics([newMetric, ...metrics]);
-    setIsOpen(false);
-
-    // Reset Form
-    setName("");
-    setAlias("");
-    setDescription("");
-    setSqlFormula("");
-
-    toast.success(`Metric "${newMetric.name}" created and synced with DataBot AI!`);
+    setIsSaving(true);
+    try {
+      const created = await ApiClient.createMetric(TENANT_ID, {
+        name,
+        description: description || undefined,
+        sql_formula: sqlFormula,
+      });
+      // Optimistic prepend
+      setMetrics((prev) => [created, ...prev]);
+      setIsOpen(false);
+      setName("");
+      setDescription("");
+      setSqlFormula("");
+      toast.success(`Metric "${created.name}" created and injected into DataBot AI!`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      toast.error(`Failed to create metric: ${msg}`);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
-  const handleDelete = (id: string, metricName: string) => {
-    setMetrics(metrics.filter((m) => m.id !== id));
-    toast.info(`Deleted metric "${metricName}".`);
+  const handleDelete = async (id: number, metricName: string) => {
+    // Optimistic UI update
+    setMetrics((prev) => prev.filter((m) => m.id !== id));
+    try {
+      await ApiClient.deleteMetric(TENANT_ID, id);
+      toast.info(`Deleted metric "${metricName}".`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      toast.error(`Failed to delete metric: ${msg}`);
+      // Re-fetch on failure to restore correct state
+      ApiClient.getMetrics(TENANT_ID)
+        .then(setMetrics)
+        .catch(() => {});
+    }
   };
 
-  const handleCopy = (id: string, formula: string) => {
+  const handleCopy = (id: number, formula: string) => {
     navigator.clipboard.writeText(formula);
     setCopiedId(id);
     toast.success("SQL Formula copied to clipboard!");
@@ -187,38 +160,14 @@ export default function MetricsPage() {
               </DialogHeader>
 
               <div className="grid gap-4 py-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-foreground">Metric Name</label>
-                    <Input
-                      placeholder="e.g. Net Revenue Retention"
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      required
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-foreground">Key / Alias</label>
-                    <Input
-                      placeholder="e.g. nrr"
-                      value={alias}
-                      onChange={(e) => setAlias(e.target.value)}
-                    />
-                  </div>
-                </div>
-
                 <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-foreground">Category</label>
-                  <select
-                    className="w-full rounded-md border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-primary"
-                    value={category}
-                    onChange={(e) => setCategory(e.target.value as MetricDefinition["category"])}
-                  >
-                    <option value="Sales">Sales Performance</option>
-                    <option value="Pipeline">Pipeline & Opportunities</option>
-                    <option value="Finance">Finance & Revenue</option>
-                    <option value="Inventory">Inventory & Supply Chain</option>
-                  </select>
+                  <label className="text-xs font-semibold text-foreground">Metric Name</label>
+                  <Input
+                    placeholder="e.g. Net Revenue Retention"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    required
+                  />
                 </div>
 
                 <div className="space-y-1.5">
@@ -236,7 +185,7 @@ export default function MetricsPage() {
                   </label>
                   <textarea
                     className="w-full min-h-[90px] rounded-md border bg-muted/40 p-2.5 font-mono text-xs shadow-sm focus:outline-none focus:ring-2 focus:ring-primary"
-                    placeholder="e.g. ((Ending MRR - Churn) / Starting MRR) * 100"
+                    placeholder="e.g. SELECT AVG(deal_value) FROM deals WHERE status = 'closed_won'"
                     value={sqlFormula}
                     onChange={(e) => setSqlFormula(e.target.value)}
                     required
@@ -245,10 +194,12 @@ export default function MetricsPage() {
               </div>
 
               <DialogFooter>
-                <Button type="button" variant="outline" onClick={() => setIsOpen(false)}>
+                <Button type="button" variant="outline" onClick={() => setIsOpen(false)} disabled={isSaving}>
                   Cancel
                 </Button>
-                <Button type="submit">Save Metric</Button>
+                <Button type="submit" disabled={isSaving}>
+                  {isSaving ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Saving...</> : "Save Metric"}
+                </Button>
               </DialogFooter>
             </form>
           </DialogContent>
@@ -262,7 +213,7 @@ export default function MetricsPage() {
             <div>
               <CardTitle className="text-base font-semibold">Configured Enterprise Metrics</CardTitle>
               <CardDescription className="text-xs mt-0.5">
-                {metrics.length} metrics registered. Active across all tagged Slack threads.
+                {isLoading ? "Loading..." : `${metrics.length} metrics registered. Active across all tagged Slack threads.`}
               </CardDescription>
             </div>
 
@@ -283,8 +234,7 @@ export default function MetricsPage() {
             <Table>
               <TableHeader>
                 <TableRow className="bg-muted/30">
-                  <TableHead className="w-[180px]">Metric Name</TableHead>
-                  <TableHead className="w-[100px]">Category</TableHead>
+                  <TableHead className="w-[200px]">Metric Name</TableHead>
                   <TableHead className="min-w-[280px]">Deterministic SQL Formula</TableHead>
                   <TableHead className="hidden md:table-cell">Description</TableHead>
                   <TableHead className="w-[100px] text-right">Actions</TableHead>
@@ -292,10 +242,19 @@ export default function MetricsPage() {
               </TableHeader>
 
               <TableBody>
-                {filteredMetrics.length === 0 ? (
+                {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={5} className="h-32 text-center text-sm text-muted-foreground">
-                      No metrics found matching &quot;{search}&quot;.
+                    <TableCell colSpan={4} className="h-32 text-center text-sm text-muted-foreground">
+                      <div className="flex items-center justify-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Loading metrics from backend...
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ) : filteredMetrics.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={4} className="h-32 text-center text-sm text-muted-foreground">
+                      {search ? `No metrics found matching "${search}".` : "No metrics defined yet. Click \"Create Metric\" to add your first canonical formula."}
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -304,21 +263,17 @@ export default function MetricsPage() {
                       <TableCell className="font-medium">
                         <div className="flex flex-col">
                           <span className="text-sm font-semibold text-foreground">{metric.name}</span>
-                          <span className="font-mono text-[11px] text-muted-foreground">@{metric.alias}</span>
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {new Date(metric.created_at).toLocaleDateString()}
+                          </span>
                         </div>
                       </TableCell>
 
                       <TableCell>
-                        <span className="inline-flex rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-semibold text-primary">
-                          {metric.category}
-                        </span>
-                      </TableCell>
-
-                      <TableCell>
                         <div className="group relative rounded bg-muted/60 p-2 font-mono text-xs text-foreground/90 border">
-                          <span className="break-all">{metric.sqlFormula}</span>
+                          <span className="break-all">{metric.sql_formula}</span>
                           <button
-                            onClick={() => handleCopy(metric.id, metric.sqlFormula)}
+                            onClick={() => handleCopy(metric.id, metric.sql_formula)}
                             className="absolute right-1.5 top-1.5 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded bg-background hover:bg-muted"
                             title="Copy Formula"
                           >
@@ -332,7 +287,7 @@ export default function MetricsPage() {
                       </TableCell>
 
                       <TableCell className="hidden md:table-cell text-xs text-muted-foreground">
-                        {metric.description}
+                        {metric.description ?? "—"}
                       </TableCell>
 
                       <TableCell className="text-right">

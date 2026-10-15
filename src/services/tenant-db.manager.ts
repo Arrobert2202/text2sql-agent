@@ -2,12 +2,39 @@ import { Pool } from 'pg';
 import { WorkspaceService } from './workspace.service';
 import { logger } from '../utils/logger';
 
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
 export class TenantDbManager {
     private poolCache: Map<string, Pool> = new Map();
+    private lastAccessedAt: Map<string, number> = new Map();
     private workspaceService: WorkspaceService;
+    private sweepInterval: ReturnType<typeof setInterval>;
 
     constructor(workspaceService: WorkspaceService) {
         this.workspaceService = workspaceService;
+
+        // Background sweep: evict pools idle for more than 15 minutes
+        this.sweepInterval = setInterval(() => {
+            this.evictIdlePools().catch(err =>
+                logger.warn({ err }, '[TenantDbManager] Error during idle pool sweep')
+            );
+        }, SWEEP_INTERVAL_MS);
+
+        // .unref() prevents this interval from blocking Node.js process exit
+        this.sweepInterval.unref();
+    }
+
+    private async evictIdlePools(): Promise<void> {
+        const now = Date.now();
+        const tenantIds = [...this.poolCache.keys()];
+        for (const tenantId of tenantIds) {
+            const lastAccess = this.lastAccessedAt.get(tenantId) ?? 0;
+            if (now - lastAccess > IDLE_TIMEOUT_MS) {
+                logger.info(`[TenantDbManager] Evicting idle pool for tenant ${tenantId} (idle > 15 min)`);
+                await this.invalidatePool(tenantId);
+            }
+        }
     }
 
     /**
@@ -16,6 +43,7 @@ export class TenantDbManager {
      */
     public async getPoolForTenant(tenantId: string): Promise<Pool | null> {
         if (this.poolCache.has(tenantId)) {
+            this.lastAccessedAt.set(tenantId, Date.now());
             return this.poolCache.get(tenantId)!;
         }
 
@@ -54,6 +82,7 @@ export class TenantDbManager {
         });
 
         this.poolCache.set(tenantId, pool);
+        this.lastAccessedAt.set(tenantId, Date.now());
         return pool;
     }
 
@@ -94,7 +123,7 @@ export class TenantDbManager {
     /**
      * Executes SQL query on tenant's external database using their read-only connection pool.
      */
-    public async queryReadOnly(tenantId: string, query: string, params: any[] = []): Promise<any[]> {
+    public async queryReadOnly(tenantId: string, query: string, params: unknown[] = []): Promise<Record<string, unknown>[]> {
         const pool = await this.getPoolForTenant(tenantId);
         if (!pool) {
             throw new Error(`No database pool available for tenant ${tenantId}`);
@@ -116,14 +145,29 @@ export class TenantDbManager {
         const pool = this.poolCache.get(tenantId);
         if (pool) {
             this.poolCache.delete(tenantId);
+            this.lastAccessedAt.delete(tenantId);
             await pool.end().catch(() => {});
         }
     }
 
-    public async closeAll(): Promise<void> {
-        for (const [tenantId, pool] of this.poolCache.entries()) {
-            await pool.end().catch(() => {});
-        }
+    /**
+     * Closes all cached tenant pools in parallel.
+     * Called during graceful shutdown.
+     */
+    public async closeAllPools(): Promise<void> {
+        clearInterval(this.sweepInterval);
+        await Promise.all(
+            [...this.poolCache.entries()].map(async ([tenantId, pool]) => {
+                logger.info(`[TenantDbManager] Closing pool for tenant ${tenantId}`);
+                await pool.end().catch(() => {});
+            })
+        );
         this.poolCache.clear();
+        this.lastAccessedAt.clear();
+    }
+
+    /** @deprecated Use closeAllPools() instead */
+    public async closeAll(): Promise<void> {
+        return this.closeAllPools();
     }
 }
